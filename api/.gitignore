@@ -1,0 +1,11 @@
+node_modules
+dist
+.env
+.env.local
+*.log
+.DS_Store
+
+# Old data files (now in MongoDB)
+data/
+markets.json
+

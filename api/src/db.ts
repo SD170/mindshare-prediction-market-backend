@@ -42,6 +42,10 @@ export interface MarketAttrs {
   lastTxHash?: string;
   deploymentDate?: Date;
   deploymentIndex?: number;
+  // Cache fields
+  poolA?: string; // BigInt as string for precision
+  poolB?: string;
+  lastSyncedAt?: Date;
 }
 
 export interface MarketDoc extends MarketAttrs, Document {}
@@ -63,6 +67,10 @@ const MarketSchema = new Schema<MarketDoc>(
     lastTxHash: String,
     deploymentDate: { type: Date, index: true },
     deploymentIndex: { type: Number, index: true },
+    // Cache fields
+    poolA: String,
+    poolB: String,
+    lastSyncedAt: Date,
   },
   { timestamps: true }
 );
@@ -95,6 +103,61 @@ const ContractSchema = new Schema<ContractDoc>(
 );
 
 export const Contract: Model<ContractDoc> = mongoose.model('Contract', ContractSchema);
+
+// User Investment Cache
+export interface UserInvestmentAttrs {
+  marketAddress: string;
+  userAddress: string;
+  aClaims: string; // BigInt as string
+  bClaims: string;
+  redeemed: boolean;
+  lastSyncedAt: Date;
+}
+
+export interface UserInvestmentDoc extends UserInvestmentAttrs, Document {}
+
+const UserInvestmentSchema = new Schema<UserInvestmentDoc>(
+  {
+    marketAddress: { type: String, required: true, index: true },
+    userAddress: { type: String, required: true, index: true },
+    aClaims: { type: String, required: true, default: '0' },
+    bClaims: { type: String, required: true, default: '0' },
+    redeemed: { type: Boolean, required: true, default: false },
+    lastSyncedAt: { type: Date, required: true, default: Date.now },
+  },
+  { timestamps: true }
+);
+
+// Compound index for efficient lookups
+UserInvestmentSchema.index({ marketAddress: 1, userAddress: 1 }, { unique: true });
+
+export const UserInvestment: Model<UserInvestmentDoc> = mongoose.model(
+  'UserInvestment',
+  UserInvestmentSchema
+);
+
+// User Balance Cache
+export interface UserBalanceAttrs {
+  userAddress: string;
+  balance: string; // BigInt as string
+  lastSyncedAt: Date;
+}
+
+export interface UserBalanceDoc extends UserBalanceAttrs, Document {}
+
+const UserBalanceSchema = new Schema<UserBalanceDoc>(
+  {
+    userAddress: { type: String, required: true, unique: true, index: true },
+    balance: { type: String, required: true, default: '0' },
+    lastSyncedAt: { type: Date, required: true, default: Date.now },
+  },
+  { timestamps: true }
+);
+
+export const UserBalance: Model<UserBalanceDoc> = mongoose.model(
+  'UserBalance',
+  UserBalanceSchema
+);
 
 export async function connectToDatabase(uri: string) {
   await mongoose.connect(uri, {

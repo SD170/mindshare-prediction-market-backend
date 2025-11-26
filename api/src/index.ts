@@ -28,6 +28,7 @@ const MARKET_ADMIN_ABI = [
 ];
 
 const STAKE_TOKEN_ABI = [
+  'function balanceOf(address account) external view returns (uint256)',
   'function transfer(address to, uint256 amount) external returns (bool)',
 ];
 
@@ -138,6 +139,79 @@ app.get('/api/leaderboard/date', async (req, res) => {
   
   const entries = await getLeaderboardForDate(date);
   res.json(entries);
+});
+
+// Admin: Regenerate leaderboard (randomize and save new snapshot)
+app.post('/api/admin/regenerate-leaderboard', async (req, res) => {
+  try {
+    const today = getDateOnly(new Date());
+    
+    // Get the latest leaderboard for today (highest index)
+    const latestEntries = await getLeaderboardForDate(today);
+    
+    if (latestEntries.length === 0) {
+      return res.status(400).json({ error: 'No leaderboard found for today. Seed data first.' });
+    }
+    
+    console.log(`🔄 Regenerating leaderboard for ${today.toISOString().split('T')[0]}...`);
+    console.log(`  Found ${latestEntries.length} entries`);
+    
+    // Randomize the leaderboard (Fisher-Yates shuffle)
+    const shuffled = [...latestEntries];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    
+    // Update ranks
+    const randomized = shuffled.map((entry, index) => ({
+      ...entry,
+      rank: index + 1,
+    }));
+    
+    console.log(`  Randomized leaderboard. New top 10: ${randomized.slice(0, 10).map((e: any) => e.name).join(', ')}`);
+    
+    // Find the highest index for today
+    const maxIndexDoc = await LeaderboardEntry.findOne({ date: today })
+      .sort({ index: -1 })
+      .select('index')
+      .lean();
+    
+    const nextIndex = maxIndexDoc ? maxIndexDoc.index + 1 : 0;
+    
+    // Delete any existing entries for this date/index (in case of retry)
+    const deleted = await LeaderboardEntry.deleteMany({ date: today, index: nextIndex });
+    if (deleted.deletedCount > 0) {
+      console.log(`  Cleared ${deleted.deletedCount} existing entries for this date/index`);
+    }
+    
+    // Insert randomized entries with new index
+    const leaderboardEntries: any[] = randomized.map((entry: any) => ({
+      name: entry.name,
+      rank: entry.rank,
+      score: entry.score,
+      logo: entry.logo,
+      date: today,
+      index: nextIndex,
+    }));
+    
+    await LeaderboardEntry.insertMany(leaderboardEntries, { ordered: false });
+    console.log(`  ✅ Successfully created new snapshot (index ${nextIndex})`);
+    
+    res.json({ 
+      success: true,
+      date: today.toISOString().split('T')[0],
+      index: nextIndex,
+      count: leaderboardEntries.length,
+      top10: randomized.slice(0, 10).map((e: any) => e.name)
+    });
+  } catch (error: any) {
+    console.error('Error regenerating leaderboard:', error);
+    res.status(500).json({ 
+      error: error.message || 'Failed to regenerate leaderboard',
+      details: error.stack 
+    });
+  }
 });
 
 // POST endpoint to save a new leaderboard snapshot (increments index automatically)
@@ -278,6 +352,15 @@ app.post('/api/faucet', async (req, res) => {
     return res.status(400).json({ error: 'Address and amount required' });
   }
 
+  // Validate amount (max 1000 tokens)
+  const amountNum = parseFloat(amount.toString());
+  if (isNaN(amountNum) || amountNum <= 0) {
+    return res.status(400).json({ error: 'Invalid amount. Must be a positive number.' });
+  }
+  if (amountNum > 1000) {
+    return res.status(400).json({ error: 'Maximum 1000 tokens per request' });
+  }
+
   const privateKey = process.env.FAUCET_PRIVATE_KEY || process.env.PRIVATE_KEY;
   if (!privateKey) {
     return res.status(500).json({ error: 'Faucet not configured' });
@@ -286,18 +369,34 @@ app.post('/api/faucet', async (req, res) => {
   try {
     const wallet = new ethers.Wallet(privateKey, provider);
 
-    const contractsPath = join(__dirname, '../../../oracle/config/contracts.json');
-    const contracts = JSON.parse(readFileSync(contractsPath, 'utf-8'));
+    // Get stake token address from database
+    const stakeTokenContract = await Contract.findOne({ type: 'stakeToken' });
+    if (!stakeTokenContract || !stakeTokenContract.address) {
+      return res.status(500).json({ error: 'Stake token not found in database. Deploy contracts first.' });
+    }
+
+    console.log(`💰 Faucet: Sending ${amount} tokens to ${address} using token ${stakeTokenContract.address}`);
 
     const stakeToken = new ethers.Contract(
-      contracts.stakeToken,
+      stakeTokenContract.address,
       STAKE_TOKEN_ABI,
       wallet
     );
 
+    // Check faucet balance first
+    const faucetBalance = await stakeToken.balanceOf(wallet.address);
     const amountWei = ethers.parseEther(amount.toString());
+    
+    if (faucetBalance < amountWei) {
+      return res.status(500).json({ 
+        error: `Insufficient faucet balance. Faucet has ${ethers.formatEther(faucetBalance)} tokens, requested ${amount}` 
+      });
+    }
+
     const tx = await stakeToken.transfer(address, amountWei);
+    console.log(`  Transaction hash: ${tx.hash}`);
     await tx.wait();
+    console.log(`  ✅ Tokens sent successfully`);
 
     res.json({ success: true, txHash: tx.hash });
   } catch (error: any) {
@@ -404,6 +503,88 @@ app.post('/api/admin/close-all', async (req, res) => {
   } catch (error: any) {
     console.error('Close-all error:', error);
     res.status(500).json({ error: error.message || 'Failed to close markets' });
+  }
+});
+
+// Generate market suggestions based on current leaderboard
+app.get('/api/admin/markets/suggest', async (req, res) => {
+  try {
+    const { top10Count = 5, h2hCount = 5 } = req.query;
+    const numTop10 = parseInt(top10Count as string, 10);
+    const numH2h = parseInt(h2hCount as string, 10);
+
+    // Get latest leaderboard (today's, highest index)
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+    
+    const latestLeaderboard = await LeaderboardEntry.find({ date: today })
+      .sort({ index: -1 })
+      .limit(1)
+      .exec();
+
+    if (latestLeaderboard.length === 0) {
+      return res.status(404).json({ error: 'No leaderboard found for today' });
+    }
+
+    const leaderboardIndex = latestLeaderboard[0].index;
+    const allProjects = await LeaderboardEntry.find({ 
+      date: today, 
+      index: leaderboardIndex 
+    })
+      .sort({ rank: 1 })
+      .exec();
+
+    if (allProjects.length < 2) {
+      return res.status(400).json({ error: 'Not enough projects in leaderboard' });
+    }
+
+    // Shuffle array for random selection
+    const shuffled = [...allProjects].sort(() => Math.random() - 0.5);
+
+    // Select Top-10 markets (random projects)
+    const top10Markets = [];
+    for (let i = 0; i < numTop10 && i < shuffled.length; i++) {
+      top10Markets.push({
+        type: 'top10',
+        projectName: shuffled[i].name
+      });
+    }
+
+    // Select H2H markets (random pairs, ensure different projects)
+    const h2hMarkets = [];
+    const usedProjects = new Set<string>();
+    let attempts = 0;
+    const maxAttempts = shuffled.length * 2;
+
+    while (h2hMarkets.length < numH2h && attempts < maxAttempts) {
+      const projectA = shuffled[Math.floor(Math.random() * shuffled.length)];
+      const projectB = shuffled[Math.floor(Math.random() * shuffled.length)];
+
+      if (projectA.name !== projectB.name && 
+          !usedProjects.has(projectA.name) && 
+          !usedProjects.has(projectB.name)) {
+        h2hMarkets.push({
+          type: 'h2h',
+          projectA: projectA.name,
+          projectB: projectB.name
+        });
+        usedProjects.add(projectA.name);
+        usedProjects.add(projectB.name);
+      }
+      attempts++;
+    }
+
+    res.json({
+      top10: top10Markets,
+      h2h: h2hMarkets,
+      top10Count: top10Markets.length,
+      h2hCount: h2hMarkets.length,
+      leaderboardDate: today.toISOString().split('T')[0],
+      leaderboardIndex
+    });
+  } catch (error: any) {
+    console.error('Error generating market suggestions:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 

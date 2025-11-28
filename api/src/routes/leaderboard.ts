@@ -15,10 +15,12 @@ async function getLeaderboardForDate(date: Date): Promise<any[]> {
     .lean();
   
   if (!maxIndexDoc) {
+    console.log(`⚠️  No leaderboard entries found for date: ${dateOnly.toISOString().split('T')[0]}`);
     return [];
   }
   
   const maxIndex = maxIndexDoc.index;
+  console.log(`📈 Using leaderboard index ${maxIndex} for date: ${dateOnly.toISOString().split('T')[0]}`);
   
   // Get all entries for this date and index, sorted by rank
   const entries = await LeaderboardEntry.find({ date: dateOnly, index: maxIndex })
@@ -29,9 +31,19 @@ async function getLeaderboardForDate(date: Date): Promise<any[]> {
 }
 
 router.get('/today', async (req, res) => {
-  const today = getDateOnly(new Date());
-  const entries = await getLeaderboardForDate(today);
-  res.json(entries);
+  try {
+    const today = getDateOnly(new Date());
+    console.log(`📊 Fetching today's leaderboard for date: ${today.toISOString().split('T')[0]}`);
+    const entries = await getLeaderboardForDate(today);
+    console.log(`✅ Found ${entries.length} entries for today`);
+    if (entries.length === 0) {
+      console.warn(`⚠️  No leaderboard entries found for today. Database might need seeding.`);
+    }
+    res.json(entries);
+  } catch (error: any) {
+    console.error('Error fetching today leaderboard:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch today leaderboard' });
+  }
 });
 
 router.get('/yesterday', async (req, res) => {

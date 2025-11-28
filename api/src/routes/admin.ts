@@ -33,16 +33,24 @@ router.post('/regenerate-leaderboard', async (req, res) => {
       [randomized[i], randomized[j]] = [randomized[j], randomized[i]];
     }
     
+    // Assign new ranks and update scores based on new standings
+    // Score formula: 10000 - (rank - 1) * 250 (gives rank 1 = 10000, rank 2 = 9750, etc.)
+    const newEntries = randomized.map((entry: any, index: number) => {
+      const newRank = index + 1;
+      const newScore = 10000 - (newRank - 1) * 250;
+      return {
+        ...entry,
+        _id: undefined,
+        rank: newRank,
+        score: newScore,
+        date: today,
+        index: maxIndex + 1,
+      };
+    });
+    
     // Save new snapshot with incremented index
     const nextIndex = maxIndex + 1;
     await LeaderboardEntry.deleteMany({ date: today, index: nextIndex });
-    
-    const newEntries = randomized.map((entry: any) => ({
-      ...entry,
-      _id: undefined,
-      date: today,
-      index: nextIndex,
-    }));
     
     await LeaderboardEntry.insertMany(newEntries);
     
